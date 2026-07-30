@@ -3,15 +3,21 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
+use cargo_metadata::{CargoOpt, MetadataCommand};
 use cargo_platform::{Cfg, Platform};
 use serde::Deserialize;
 
-use cargo_hawk_internal::graph::{Definition, DefinitionKind, Finding, FindingKind, Fragment};
+use cargo_hawk_internal::graph::{
+    AuditedFragments, Definition, DefinitionKind, Finding, FindingKind, Fragment,
+};
+use cargo_hawk_internal::source_path;
 
 #[derive(Debug)]
 pub(crate) struct Config {
+    workspace_root: PathBuf,
     path: Option<PathBuf>,
     source: String,
     preserve_uniform_field_visibility: bool,
@@ -52,16 +58,47 @@ struct DiagnosticExclusion {
 #[derive(Clone, Debug)]
 enum ExclusionSelector {
     Module(String),
-    File(String),
+    File {
+        configured: String,
+        identity: OnceLock<String>,
+    },
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct ProductionConsumer {
     pub(crate) package: String,
-    pub(crate) binary: String,
+    pub(crate) product: ProductionProduct,
     pub(crate) reason: String,
     pub(crate) target: Option<Platform>,
     pub(crate) span: ConfigSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ProductionProduct {
+    Binary(String),
+    Library(String),
+}
+
+impl ProductionProduct {
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            Self::Binary(name) | Self::Library(name) => name,
+        }
+    }
+
+    pub(crate) const fn kind(&self) -> crate::protocol::ProductionTargetKind {
+        match self {
+            Self::Binary(_) => crate::protocol::ProductionTargetKind::Binary,
+            Self::Library(_) => crate::protocol::ProductionTargetKind::Library,
+        }
+    }
+
+    pub(crate) const fn cargo_flag(&self) -> &'static str {
+        match self {
+            Self::Binary(_) => "--bin",
+            Self::Library(_) => "--lib",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -185,7 +222,9 @@ struct RawDiagnosticExclusion {
 struct RawProductionConsumer {
     package: String,
     #[serde(rename = "bin")]
-    binary: String,
+    binary: Option<String>,
+    #[serde(rename = "lib")]
+    library: Option<String>,
     reason: String,
     target: Option<String>,
 }
@@ -194,21 +233,6 @@ struct RawProductionConsumer {
 #[serde(deny_unknown_fields)]
 struct RawDoctestPackage {
     package: String,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            path: None,
-            source: String::new(),
-            preserve_uniform_field_visibility: false,
-            overrides: Vec::new(),
-            exclusions: Vec::new(),
-            production: Vec::new(),
-            doctests: None,
-            feature_profiles: vec![FeatureProfile::all_features()],
-        }
-    }
 }
 
 impl FeatureProfile {
@@ -229,6 +253,18 @@ impl FeatureProfile {
         command.args(self.cargo_arguments());
     }
 
+    pub(crate) fn configure_metadata(&self, command: &mut MetadataCommand) {
+        if self.all_features {
+            command.features(CargoOpt::AllFeatures);
+        }
+        if self.no_default_features {
+            command.features(CargoOpt::NoDefaultFeatures);
+        }
+        if !self.features.is_empty() {
+            command.features(CargoOpt::SomeFeatures(self.features.clone()));
+        }
+    }
+
     pub(crate) fn cargo_arguments_description(&self) -> String {
         self.cargo_arguments().collect::<Vec<_>>().join(" ")
     }
@@ -247,7 +283,24 @@ impl FeatureProfile {
 }
 
 impl Config {
+    fn empty(workspace_root: PathBuf) -> Self {
+        Self {
+            workspace_root,
+            path: None,
+            source: String::new(),
+            preserve_uniform_field_visibility: false,
+            overrides: Vec::new(),
+            exclusions: Vec::new(),
+            production: Vec::new(),
+            doctests: None,
+            feature_profiles: vec![FeatureProfile::all_features()],
+        }
+    }
+
     pub(crate) fn load(workspace_root: &Path, configured_path: Option<&Path>) -> Result<Self> {
+        let canonical_workspace_root = workspace_root
+            .canonicalize()
+            .with_context(|| format!("resolve workspace root {}", workspace_root.display()))?;
         let path = configured_path
             .map(Path::to_path_buf)
             .unwrap_or_else(|| workspace_root.join("hawk.toml"));
@@ -256,7 +309,7 @@ impl Config {
             Err(error)
                 if error.kind() == std::io::ErrorKind::NotFound && configured_path.is_none() =>
             {
-                return Ok(Self::default());
+                return Ok(Self::empty(canonical_workspace_root));
             }
             Err(error) => {
                 return Err(error).with_context(|| format!("read {}", path.display()));
@@ -392,7 +445,10 @@ impl Config {
                 (Some(module), None) if !module.trim().is_empty() => {
                     ExclusionSelector::Module(module)
                 }
-                (None, Some(file)) if !file.trim().is_empty() => ExclusionSelector::File(file),
+                (None, Some(file)) if !file.trim().is_empty() => ExclusionSelector::File {
+                    configured: file,
+                    identity: OnceLock::new(),
+                },
                 (Some(_), None) => {
                     bail!(
                         "exclusion in {}:{}:{} must provide a non-empty `module` selector",
@@ -449,6 +505,22 @@ impl Config {
                     span.column
                 );
             }
+            let product = match (entry.binary, entry.library) {
+                (Some(binary), None) if !binary.trim().is_empty() => {
+                    ProductionProduct::Binary(binary)
+                }
+                (None, Some(library)) if !library.trim().is_empty() => {
+                    ProductionProduct::Library(library)
+                }
+                _ => {
+                    bail!(
+                        "production consumer in {}:{}:{} must provide exactly one non-empty `bin` or `lib` target",
+                        path.display(),
+                        span.line,
+                        span.column
+                    );
+                }
+            };
             let target = entry
                 .target
                 .map(|target| {
@@ -464,7 +536,7 @@ impl Config {
                 .transpose()?;
             production.push(ProductionConsumer {
                 package: entry.package,
-                binary: entry.binary,
+                product,
                 reason: entry.reason,
                 target,
                 span,
@@ -503,6 +575,7 @@ impl Config {
             Some(packages)
         };
         Ok(Self {
+            workspace_root: canonical_workspace_root,
             path: Some(path),
             source,
             preserve_uniform_field_visibility: raw.preserve_uniform_field_visibility,
@@ -540,17 +613,29 @@ impl Config {
         target: &AnalysisTarget,
         production_fragments: &[Fragment],
         test_fragments: &[Fragment],
+        candidate_crates: &HashSet<String>,
         findings: Vec<Finding<'findings>>,
     ) -> AppliedFindings<'findings, 'config> {
+        let audited_fragments = AuditedFragments::new(production_fragments, test_fragments);
         let known_items: HashSet<KnownItemIdentity<'_>> = production_fragments
             .iter()
             .chain(test_fragments)
+            .filter(|fragment| fragment.compilation_target == target.name)
+            .filter(|fragment| {
+                !candidate_crates.contains(&fragment.crate_name)
+                    || audited_fragments.contains(fragment)
+            })
             .flat_map(|fragment| &fragment.definitions)
             .map(known_item_identity)
             .collect();
         let logical_items: HashSet<LogicalItemIdentity<'_>> = production_fragments
             .iter()
             .chain(test_fragments)
+            .filter(|fragment| fragment.compilation_target == target.name)
+            .filter(|fragment| {
+                !candidate_crates.contains(&fragment.crate_name)
+                    || audited_fragments.contains(fragment)
+            })
             .flat_map(|fragment| {
                 fragment.definitions.iter().map(|definition| {
                     logical_item_identity(fragment.package_name.as_str(), definition)
@@ -563,6 +648,12 @@ impl Config {
             .overrides
             .iter()
             .filter(|entry| entry.applies_to(target))
+            .filter(|entry| {
+                candidate_crates.contains(&entry.crate_name)
+                    || !logical_items
+                        .iter()
+                        .any(|item| item.crate_name == entry.crate_name)
+            })
         {
             let matching_items = logical_items
                 .iter()
@@ -596,13 +687,19 @@ impl Config {
             .exclusions
             .iter()
             .filter(|entry| entry.applies_to(target))
-            .filter(|entry| known_items.iter().any(|item| entry.identifies(item)))
+            .filter(|entry| {
+                known_items
+                    .iter()
+                    .any(|item| entry.identifies(item, &self.workspace_root))
+            })
             .collect::<Vec<_>>();
         let findings = findings
             .into_iter()
             .filter(|finding| {
                 !active_overrides.iter().any(|entry| entry.matches(finding))
-                    && !active_exclusions.iter().any(|entry| entry.matches(finding))
+                    && !active_exclusions
+                        .iter()
+                        .any(|entry| entry.matches(finding, &self.workspace_root))
             })
             .collect();
         AppliedFindings {
@@ -694,6 +791,10 @@ impl AnalysisTarget {
             .collect::<Result<Vec<_>>>()?;
         Ok(Self { name, cfgs })
     }
+
+    pub(crate) fn matches_platform(&self, platform: &Platform) -> bool {
+        platform.matches(&self.name, &self.cfgs)
+    }
 }
 
 impl LintOverride {
@@ -728,19 +829,19 @@ impl DiagnosticExclusion {
             .is_none_or(|platform| platform.matches(&target.name, &target.cfgs))
     }
 
-    fn identifies(&self, item: &KnownItemIdentity<'_>) -> bool {
+    fn identifies(&self, item: &KnownItemIdentity<'_>, workspace_root: &Path) -> bool {
         self.crate_name == item.crate_name
             && match &self.selector {
                 ExclusionSelector::Module(module) => {
                     item.kind == DefinitionKind::Module && item.item == module
                 }
-                ExclusionSelector::File(file) => {
-                    item.file.is_some_and(|item_file| item_file == file)
-                }
+                ExclusionSelector::File { .. } => item
+                    .file
+                    .is_some_and(|item_file| self.selector.matches_file(workspace_root, item_file)),
             }
     }
 
-    fn matches(&self, finding: &Finding<'_>) -> bool {
+    fn matches(&self, finding: &Finding<'_>, workspace_root: &Path) -> bool {
         self.crate_name == finding.definition.crate_name
             && match &self.selector {
                 ExclusionSelector::Module(module) => {
@@ -751,12 +852,33 @@ impl DiagnosticExclusion {
                             .strip_prefix(module)
                             .is_some_and(|suffix| suffix.starts_with("::"))
                 }
-                ExclusionSelector::File(file) => finding
+                ExclusionSelector::File { .. } => finding
                     .definition
                     .span
                     .as_ref()
-                    .is_some_and(|span| span.file == *file),
+                    .is_some_and(|span| self.selector.matches_file(workspace_root, &span.file)),
             }
+    }
+}
+
+impl ExclusionSelector {
+    /// Matches the same identity emitted by the driver when the configured file
+    /// exists, with a lexical fallback for target-generated or optional files.
+    fn matches_file(&self, workspace_root: &Path, source: &str) -> bool {
+        let Self::File {
+            configured,
+            identity,
+        } = self
+        else {
+            return false;
+        };
+        let identity = identity.get_or_init(|| {
+            let configured_path =
+                source_path::lexically_normalize(&workspace_root.join(configured));
+            source_path::canonical_identity(workspace_root, &configured_path)
+                .unwrap_or_else(|_| source_path::lexical_identity(workspace_root, &configured_path))
+        });
+        source == identity
     }
 }
 
@@ -782,10 +904,13 @@ fn config_span(source: &str, offset: usize) -> ConfigSpan {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::sync::OnceLock;
 
     use cargo_platform::Cfg;
 
-    use super::{AnalysisTarget, Config, ConfigDiagnosticKind};
+    use super::{
+        AnalysisTarget, Config, ConfigDiagnosticKind, ExclusionSelector, ProductionProduct,
+    };
     use cargo_hawk_internal::graph::{
         Definition, DefinitionId, DefinitionKind, FindingKind, Fragment, Span, analyze,
     };
@@ -802,10 +927,13 @@ mod tests {
             protocol_version: crate::protocol::ProtocolVersion,
             package_name: "library".into(),
             crate_name: "library".into(),
+            compilation_target: "aarch64-apple-darwin".into(),
             crate_id: test_id("library"),
             crate_root: Some("library/src/lib.rs".into()),
             is_product_root: false,
+            product_root_kind: None,
             test_surface: false,
+            non_production_consumer: false,
             definitions: vec![Definition {
                 id: test_id("unused"),
                 crate_name: "library".into(),
@@ -993,11 +1121,79 @@ reason = "known retained public surface"
             &target("aarch64-apple-darwin", &["unix"]),
             &fragments,
             &[],
+            &candidate_crates(),
             findings,
         );
 
         assert!(applied.findings.is_empty());
         assert!(applied.config_diagnostics.is_empty());
+    }
+
+    #[test]
+    fn overrides_outside_the_candidate_crates_are_ignored() {
+        let directory = tempfile::tempdir().expect("temporary configuration directory");
+        let path = directory.path().join("hawk.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[override]]
+lint = "hawk::dead_public"
+crate = "library"
+item = "unused"
+level = "expect"
+reason = "separate library audit"
+"#,
+        )
+        .expect("write configuration");
+        let config = Config::load(directory.path(), Some(&path)).expect("load configuration");
+        let fragments = vec![fragment()];
+        let candidates = HashSet::from(["selected_library".to_owned()]);
+
+        let applied = config.apply(
+            &target("aarch64-apple-darwin", &["unix"]),
+            &fragments,
+            &[],
+            &candidates,
+            vec![],
+        );
+
+        assert!(applied.findings.is_empty());
+        assert!(applied.config_diagnostics.is_empty());
+    }
+
+    #[test]
+    fn unknown_crate_overrides_are_still_reported_outside_the_candidate_crates() {
+        let directory = tempfile::tempdir().expect("temporary configuration directory");
+        let path = directory.path().join("hawk.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[override]]
+lint = "hawk::dead_public"
+crate = "unknown_library"
+item = "unused"
+level = "expect"
+reason = "detect misspelled crate selectors"
+"#,
+        )
+        .expect("write configuration");
+        let config = Config::load(directory.path(), Some(&path)).expect("load configuration");
+        let fragments = vec![fragment()];
+        let candidates = HashSet::from(["selected_library".to_owned()]);
+
+        let applied = config.apply(
+            &target("aarch64-apple-darwin", &["unix"]),
+            &fragments,
+            &[],
+            &candidates,
+            vec![],
+        );
+
+        assert_eq!(applied.config_diagnostics.len(), 1);
+        assert_eq!(
+            applied.config_diagnostics[0].kind,
+            ConfigDiagnosticKind::UnknownItem
+        );
     }
 
     #[test]
@@ -1050,6 +1246,7 @@ reason = "retain every compiled cfg alternative"
             &target("aarch64-apple-darwin", &["unix"]),
             &production_fragments,
             &test_fragments,
+            &candidate_crates(),
             findings,
         );
 
@@ -1081,11 +1278,48 @@ reason = "detect stale selectors"
             &target("aarch64-apple-darwin", &["unix"]),
             &fragments,
             &[],
+            &candidate_crates(),
             findings,
         );
 
         assert_eq!(applied.findings.len(), 1);
         assert_eq!(applied.findings[0].kind, FindingKind::DeadPublic);
+        assert_eq!(applied.config_diagnostics.len(), 1);
+        assert_eq!(
+            applied.config_diagnostics[0].kind,
+            ConfigDiagnosticKind::UnknownItem
+        );
+    }
+
+    #[test]
+    fn host_only_item_is_unknown_for_analysis_target() {
+        let directory = tempfile::tempdir().expect("temporary configuration directory");
+        let path = directory.path().join("hawk.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[override]]
+lint = "hawk::dead_public"
+crate = "library"
+item = "host_only"
+level = "expect"
+reason = "detect selectors outside the analyzed target"
+"#,
+        )
+        .expect("write configuration");
+        let config = Config::load(directory.path(), Some(&path)).expect("load configuration");
+        let mut host_fragment = fragment();
+        host_fragment.compilation_target = "x86_64-apple-darwin".into();
+        host_fragment.definitions[0].name = "host_only".into();
+
+        let applied = config.apply(
+            &target("aarch64-apple-darwin", &["unix"]),
+            &[host_fragment],
+            &[],
+            &candidate_crates(),
+            Vec::new(),
+        );
+
         assert_eq!(applied.config_diagnostics.len(), 1);
         assert_eq!(
             applied.config_diagnostics[0].kind,
@@ -1117,6 +1351,7 @@ reason = "ambiguous Rust namespace"
             &target("aarch64-apple-darwin", &["unix"]),
             &fragments,
             &[],
+            &candidate_crates(),
             findings,
         );
 
@@ -1153,6 +1388,7 @@ reason = "retain the type alias"
             &target("aarch64-apple-darwin", &["unix"]),
             &fragments,
             &[],
+            &candidate_crates(),
             findings,
         );
 
@@ -1183,12 +1419,21 @@ reason = "only retained on Windows"
         .expect("write configuration");
         let config = Config::load(directory.path(), Some(&path)).expect("load configuration");
         let fragments = vec![fragment()];
+        let mut windows_fragment = fragment();
+        windows_fragment.compilation_target = "x86_64-pc-windows-msvc".into();
+        let windows_fragments = vec![windows_fragment];
 
         let windows = config.apply(
             &target("x86_64-pc-windows-msvc", &["windows"]),
-            &fragments,
+            &windows_fragments,
             &[],
-            analyze(&fragments, &[], &candidate_crates(), &HashSet::new()),
+            &candidate_crates(),
+            analyze(
+                &windows_fragments,
+                &[],
+                &candidate_crates(),
+                &HashSet::new(),
+            ),
         );
         assert!(windows.findings.is_empty());
         assert!(windows.config_diagnostics.is_empty());
@@ -1197,6 +1442,7 @@ reason = "only retained on Windows"
             &target("aarch64-apple-darwin", &["unix"]),
             &fragments,
             &[],
+            &candidate_crates(),
             analyze(&fragments, &[], &candidate_crates(), &HashSet::new()),
         );
         assert_eq!(unix.findings.len(), 1);
@@ -1228,6 +1474,7 @@ reason = "only compiled on Windows"
             &target("aarch64-apple-darwin", &["unix"]),
             &fragments,
             &[],
+            &candidate_crates(),
             findings,
         );
 
@@ -1256,6 +1503,7 @@ reason = "generated public declarations"
             &target("aarch64-apple-darwin", &["unix"]),
             &fragments,
             &[],
+            &candidate_crates(),
             analyze(&fragments, &[], &candidate_crates(), &HashSet::new()),
         );
 
@@ -1291,6 +1539,7 @@ reason = "not actually a module"
             &target("aarch64-apple-darwin", &["unix"]),
             &fragments,
             &[],
+            &candidate_crates(),
             analyze(&fragments, &[], &candidate_crates(), &HashSet::new()),
         );
 
@@ -1318,6 +1567,7 @@ reason = "generated source file"
             &target("aarch64-apple-darwin", &["unix"]),
             &fragments,
             &[],
+            &candidate_crates(),
             analyze(&fragments, &[], &candidate_crates(), &HashSet::new()),
         );
 
@@ -1330,6 +1580,31 @@ reason = "generated source file"
             vec!["outside", "generatedish"]
         );
         assert!(applied.config_diagnostics.is_empty());
+    }
+
+    #[test]
+    fn file_exclusions_follow_filesystem_case_sensitivity() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        std::fs::create_dir_all(directory.path().join("Library/src"))
+            .expect("create source directory");
+        std::fs::write(
+            directory.path().join("Library/src/Shared.rs"),
+            "pub fn shared() {}\n",
+        )
+        .expect("write source file");
+        let workspace_root = directory.path().canonicalize().expect("resolve workspace");
+        let configured = "library/src/shared.rs";
+        let case_alias_exists = workspace_root.join(configured).canonicalize().is_ok();
+        let selector = ExclusionSelector::File {
+            configured: configured.to_owned(),
+            identity: OnceLock::new(),
+        };
+
+        assert_eq!(
+            selector.matches_file(&workspace_root, "Library/src/Shared.rs"),
+            case_alias_exists
+        );
+        assert!(!selector.matches_file(&workspace_root, "Library/src/Other.rs"));
     }
 
     #[test]
@@ -1349,12 +1624,21 @@ reason = "generated only on Windows"
         .expect("write configuration");
         let config = Config::load(directory.path(), Some(&path)).expect("load configuration");
         let fragments = vec![scoped_fragment()];
+        let mut windows_fragment = scoped_fragment();
+        windows_fragment.compilation_target = "x86_64-pc-windows-msvc".into();
+        let windows_fragments = vec![windows_fragment];
 
         let windows = config.apply(
             &target("x86_64-pc-windows-msvc", &["windows"]),
-            &fragments,
+            &windows_fragments,
             &[],
-            analyze(&fragments, &[], &candidate_crates(), &HashSet::new()),
+            &candidate_crates(),
+            analyze(
+                &windows_fragments,
+                &[],
+                &candidate_crates(),
+                &HashSet::new(),
+            ),
         );
         assert_eq!(windows.findings.len(), 2);
 
@@ -1362,6 +1646,7 @@ reason = "generated only on Windows"
             &target("aarch64-apple-darwin", &["unix"]),
             &fragments,
             &[],
+            &candidate_crates(),
             analyze(&fragments, &[], &candidate_crates(), &HashSet::new()),
         );
         assert_eq!(unix.findings.len(), 4);
@@ -1414,7 +1699,10 @@ reason = "shipped on Windows"
             .collect::<Vec<_>>();
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].package, "windows-runner");
-        assert_eq!(windows[0].binary, "windows-runner");
+        assert_eq!(
+            windows[0].product,
+            ProductionProduct::Binary("windows-runner".to_owned())
+        );
 
         assert_eq!(
             config
@@ -1422,6 +1710,56 @@ reason = "shipped on Windows"
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn accepts_library_production_consumers() {
+        let directory = tempfile::tempdir().expect("temporary configuration directory");
+        let path = directory.path().join("hawk.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[production]]
+package = "internal-api"
+lib = "internal_api"
+reason = "internal library API"
+"#,
+        )
+        .expect("write configuration");
+        let config = Config::load(directory.path(), Some(&path)).expect("load configuration");
+
+        let products = config
+            .production_consumers(&target("aarch64-apple-darwin", &["unix"]))
+            .collect::<Vec<_>>();
+        assert_eq!(products.len(), 1);
+        assert_eq!(products[0].package, "internal-api");
+        assert_eq!(
+            products[0].product,
+            ProductionProduct::Library("internal_api".to_owned())
+        );
+    }
+
+    #[test]
+    fn production_consumers_require_exactly_one_target() {
+        for targets in ["", "bin = \"app\"\nlib = \"library\"", "lib = \"\""] {
+            let directory = tempfile::tempdir().expect("temporary configuration directory");
+            let path = directory.path().join("hawk.toml");
+            std::fs::write(
+                &path,
+                format!(
+                    "[[production]]\npackage = \"app\"\n{targets}\nreason = \"production target\"\n"
+                ),
+            )
+            .expect("write configuration");
+
+            let error = Config::load(directory.path(), Some(&path))
+                .expect_err("reject missing or ambiguous production target");
+            assert!(
+                error
+                    .to_string()
+                    .contains("must provide exactly one non-empty `bin` or `lib` target")
+            );
+        }
     }
 
     #[test]

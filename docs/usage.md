@@ -46,8 +46,10 @@ cargo build
 
 ## Configure production targets
 
-Declare each shipped binary as a production target in `hawk.toml` at the root
-of the workspace being analyzed:
+Without a `hawk.toml`, Hawk treats every workspace binary as a production
+target. To select specific binaries or audit internal libraries, declare the
+desired production targets in `hawk.toml` at the root of the workspace being
+analyzed:
 
 ```toml
 [[production]]
@@ -56,10 +58,11 @@ bin = "app"
 reason = "shipped application binary"
 ```
 
-Every configured package and binary must be a target of that workspace. Hawk
-does not infer production targets: an API used by an omitted binary can be
-reported as unnecessary or dead. See [Configuration](configuration.md) for
-multiple binaries, target-scoped entries, and accepted findings.
+Every configured package and binary must be a target of that workspace. Once a
+configuration file exists, its production targets are authoritative: an API used
+only by an omitted binary can be reported as unnecessary or dead. See
+[Configuration](configuration.md) for multiple binaries, target-scoped entries,
+and accepted findings.
 
 ## Run analysis
 
@@ -110,10 +113,10 @@ stderr and do not produce a JSON report:
   --output-format=json > hawk-report.json
 ```
 
-The JSON report is versioned with `schema_version` (currently `3`); breaking
+The JSON report is versioned with `schema_version` (currently `4`); breaking
 schema changes increment this version. Its `summary` describes the compilation
-target, configured production binaries, feature profiles, non-production
-coverage, and emitted diagnostic count.
+target, configured production binaries or libraries, feature profiles,
+non-production coverage, and emitted diagnostic count.
 Every entry in `diagnostics` includes its category, lint code, and severity.
 Finding entries additionally include their finding kind, semantic identity
 (`package`, `crate`, `item`, definition `kind`, parent, and module scope),

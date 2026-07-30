@@ -4,12 +4,12 @@ Hawk applies a Clippy-shaped user experience to a question that cannot be
 answered by a single crate compilation: which public declarations are
 actually needed by a closed-world Cargo workspace product?
 
-A binary product such as `uv` or `ruff` may be split across many internal
-library crates. Rust requires cross-crate references to cross a `pub`
-boundary, even when no external library API is intended. Rustc and Clippy see
-each of those crate boundaries; Hawk additionally knows which workspace
-binaries constitute the production targets and which workspace targets consume
-code only outside production.
+A binary product such as `uv` or `ruff`, or an internal library product, may be
+split across many workspace crates. Rust requires cross-crate references to
+cross a `pub` boundary, even when no external library API is intended. Rustc
+and Clippy see each of those crate boundaries; Hawk additionally knows which
+workspace binaries or libraries constitute the production targets and which
+workspace targets consume code only outside production.
 
 This document describes the implementation on `main`. It compares Hawk with
 Clippy's architecture and tooling model, not with the implementation of any
@@ -75,18 +75,30 @@ compatible with arbitrary compiler versions.
 ## Product model
 
 Hawk treats workspace library crates as internal implementation crates unless
-the caller excludes them with `--exclude-crate`. It does not infer production
-targets from every binary that happens to compile. Each production target is
-stated in `hawk.toml`:
+the caller excludes them with `--exclude-crate`. Without `hawk.toml`, every
+workspace binary is a production target. When a configuration file exists, each
+production binary or audited internal library is stated explicitly:
 
 ```toml
 [[production]]
 package = "uv"
 bin = "uv"
 reason = "shipped package manager binary"
+
+[[production]]
+package = "uv-distribution"
+lib = "uv_distribution"
+reason = "internal library consumed only within this workspace"
 ```
 
-Applicable `[[production]]` entries seed the production graph. Hawk also
+Binary entries seed the production graph at their executable entry points.
+Library entries instead seed reachability from ordinary cross-crate workspace
+callers and conservative retained-code roots; unreachable private declarations do
+not become entry points. Test harnesses, examples, benchmarks, build scripts, and
+libraries reached only through development dependencies contribute only to
+non-production reachability. Their public declarations remain
+diagnostic candidates. When every entry selects a library, findings are scoped
+to the configured library crates. Hawk also
 compiles workspace non-production targets under
 `cargo check --workspace --all-targets` and compile-only doctests under
 `cargo test --workspace --doc`. Configured `[[doctest]]` entries replace the
@@ -127,7 +139,8 @@ An analysis run proceeds as follows:
      |
      | read Cargo metadata, hawk.toml, lint levels, and target cfg
      v
- cargo check --package <package> --bin <target>    (once per target and feature profile)
+ cargo check --package <package> --bin <target>    (once per binary and feature profile)
+ cargo check --package <package> --lib             (once per library and feature profile)
  cargo check --workspace --all-targets              (once per feature profile)
  cargo test --workspace|--package <package> --doc   (once per feature profile)
      |
@@ -167,8 +180,9 @@ not findings, during the collection phase.
 The wrapper records a `Fragment` for each compiled workspace crate. A fragment
 contains:
 
-- the owning Cargo package name and rustc crate identity, which are tracked
-  separately;
+- the owning Cargo package name, rustc crate identity, compilation target, and
+  consumer provenance, which distinguish target libraries from host-side build
+  dependencies and non-production consumers;
 - definitions, including source location, item kind, lexical module scope,
   and whether the item is a public-surface, restricted-visibility, or
   crate-visible candidate;
@@ -221,15 +235,34 @@ merges identities by physical source span and item kind, including a path
 module compiled into different crates; declarations without source spans use
 their diagnostic paths instead.
 
+That merge requires one spelling per source file. Cargo compiles the same file
+under different working directories and rustc reports the path relative to
+whichever was used, so the driver resolves each name against its own session's
+working directory, resolves existing files to the spelling stored by the
+filesystem, and then expresses them relative to the workspace root the frontend
+supplies. Separators are normalized so aliases converge without assuming that
+an entire host operating system is case-insensitive.
+
+The guarantee covers workspace sources. Files outside the workspace, including
+the bundles rustdoc generates in a temporary directory for doctests, keep an
+absolute path: they are consistent within one analysis, and giving them a
+reusable relative name could merge unrelated generated snippets.
+
 The analysis then computes two reachability closures:
 
-- **production live** begins at each configured production target entry point;
+- **production live** begins at configured binary entry points and actual
+  production workspace references into selected libraries;
 - **non-production live** begins at executable entry points compiled for
   tests, benches, examples, or doctests.
 
-Both closures include conservative roots, currently used for trait-associated
-implementation code whose dispatch is not safely modeled by direct call
-edges.
+Both closures also include conservative roots when entry-point traversal alone
+is insufficient. These include conservatively modeled trait-associated code,
+declarations covered by `#[allow(dead_code)]`, and declarations whose codegen
+attributes indicate external addressing or explicit retention, such as
+`no_mangle`, `export_name`, and `used`.
+
+A conservative root establishes liveness only; it does not require public
+Rust visibility.
 
 Separately, Hawk computes the declarations whose public visibility is
 required. Any compiled cross-crate reference requires the referenced
@@ -246,8 +279,9 @@ For each public candidate in a non-excluded workspace library crate:
 | Live in production or non-production, but not required public     | `hawk::unnecessary_public` |
 | Required public by a compiled cross-crate consumer or interface   | no visibility finding      |
 
-A selected production target is not a library surface to reduce, so its crate
-does not receive these findings.
+A selected production binary is not a library surface to reduce, so its crate
+does not receive these findings. Selected library targets remain eligible for
+both public and restricted-visibility findings.
 
 For each explicit restricted-visibility candidate, Hawk separately finds every
 compiled reference across production and non-production fragments:

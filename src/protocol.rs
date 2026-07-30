@@ -3,14 +3,19 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Version of the protocol shared by the Hawk frontend and compiler driver.
 ///
-/// Increment this whenever the serialized graph or fix-plan schema changes.
-pub const VERSION: u32 = 7;
+/// Increment this whenever the serialized graph or fix-plan schema changes, the
+/// required frontend-driver environment contract changes, or the meaning of a
+/// serialized value changes. Workspace source paths became canonical
+/// workspace-relative identities in 9, which also made the workspace root a
+/// required environment value; sources outside the workspace stay absolute.
+pub const VERSION: u32 = 9;
 
 pub const VERSION_ARGUMENT: &str = "--hawk-protocol-version";
 
 pub const VERSION_ENV: &str = "HAWK_PROTOCOL_VERSION";
 pub const OUTPUT_DIR_ENV: &str = "HAWK_OUTPUT_DIR";
 pub const ROOT_CRATE_ENV: &str = "HAWK_ROOT_CRATE";
+pub const WORKSPACE_ROOT_ENV: &str = "HAWK_WORKSPACE_ROOT";
 pub const CONSUMER_MODE_ENV: &str = "HAWK_CONSUMER_MODE";
 pub const COLLECTION_OPTIONS_ENV: &str = "HAWK_COLLECTION_OPTIONS";
 pub const RUN_ID_ENV: &str = "HAWK_RUN_ID";
@@ -22,6 +27,7 @@ pub const ENVIRONMENT_VARIABLES: &[&str] = &[
     VERSION_ENV,
     OUTPUT_DIR_ENV,
     ROOT_CRATE_ENV,
+    WORKSPACE_ROOT_ENV,
     CONSUMER_MODE_ENV,
     COLLECTION_OPTIONS_ENV,
     RUN_ID_ENV,
@@ -34,6 +40,22 @@ pub const ENVIRONMENT_VARIABLES: &[&str] = &[
 pub enum ConsumerMode {
     Production,
     NonProduction,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductionTargetKind {
+    Binary,
+    Library,
+}
+
+impl ProductionTargetKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Binary => "binary",
+            Self::Library => "library",
+        }
+    }
 }
 
 impl ConsumerMode {
@@ -83,7 +105,7 @@ impl<'de> Deserialize<'de> for ProtocolVersion {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConsumerMode, ProtocolVersion};
+    use super::{ConsumerMode, ProductionTargetKind, ProtocolVersion};
 
     #[test]
     fn consumer_modes_round_trip() {
@@ -95,13 +117,19 @@ mod tests {
     }
 
     #[test]
+    fn production_target_kinds_are_named() {
+        assert_eq!(ProductionTargetKind::Binary.as_str(), "binary");
+        assert_eq!(ProductionTargetKind::Library.as_str(), "library");
+    }
+
+    #[test]
     fn rejects_mismatched_serialized_version() {
         let error = serde_json::from_str::<ProtocolVersion>("1")
             .expect_err("mismatched protocol version should fail");
 
         assert_eq!(
             error.to_string(),
-            "unsupported Hawk protocol version 1; expected 7"
+            "unsupported Hawk protocol version 1; expected 9"
         );
     }
 }

@@ -3,8 +3,9 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
 use rustc_ast as ast;
@@ -36,6 +37,7 @@ use cargo_hawk_internal::graph::{
     DefinitionKind, Edge, EdgeKind, ExpansionSpan, FindingKind, FixPlan, FixTarget, Fragment, Span,
     VisibilityReduction,
 };
+use cargo_hawk_internal::source_path;
 
 pub(crate) fn is_protocol_version_query(args: &[String]) -> bool {
     args.get(1)
@@ -55,13 +57,23 @@ pub(crate) fn is_wrapper_invocation(args: &[String]) -> bool {
 }
 
 pub(crate) fn run_wrapper(mut args: Vec<String>) -> ExitCode {
-    let (consumer_mode, run_id) = match validate_frontend_protocol() {
+    let (consumer_mode, run_id, workspace_root) = match validate_frontend_protocol() {
         Ok(protocol) => protocol,
         Err(error) => {
             eprintln!("hawk: {error:#}");
             return ExitCode::FAILURE;
         }
     };
+    let source_paths = match SourcePathNormalizer::new(&workspace_root) {
+        Ok(source_paths) => source_paths,
+        Err(error) => {
+            eprintln!("hawk: {error:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    SOURCE_PATHS
+        .set(source_paths)
+        .expect("source paths are initialized once per driver invocation");
     args.remove(1);
     let output_dir = PathBuf::from(
         env::var_os(protocol::OUTPUT_DIR_ENV).expect("HAWK_OUTPUT_DIR checked before dispatch"),
@@ -109,13 +121,39 @@ pub(crate) fn run_wrapper(mut args: Vec<String>) -> ExitCode {
     })
 }
 
-fn validate_frontend_protocol() -> Result<(protocol::ConsumerMode, String)> {
+fn validate_frontend_protocol() -> Result<(protocol::ConsumerMode, String, PathBuf)> {
     let version = env::var(protocol::VERSION_ENV)
         .context("Hawk frontend did not provide a compiler driver protocol version")?;
     validate_frontend_protocol_version(&version)?;
     let consumer_mode = parse_consumer_mode(env::var_os(protocol::CONSUMER_MODE_ENV).as_deref())?;
     let run_id = parse_run_id(env::var_os(protocol::RUN_ID_ENV).as_deref())?;
-    Ok((consumer_mode, run_id))
+    let workspace_root =
+        parse_workspace_root(env::var_os(protocol::WORKSPACE_ROOT_ENV).as_deref())?;
+    Ok((consumer_mode, run_id, workspace_root))
+}
+
+/// Source identity depends on one fixed reference directory, so the frontend
+/// must name it. A driver that guessed instead would silently produce a second,
+/// incompatible identity scheme for the same protocol version.
+fn parse_workspace_root(value: Option<&OsStr>) -> Result<PathBuf> {
+    let value = value.with_context(|| {
+        format!(
+            "Hawk frontend did not provide {}",
+            protocol::WORKSPACE_ROOT_ENV
+        )
+    })?;
+    if value.is_empty() {
+        bail!("{} must not be empty", protocol::WORKSPACE_ROOT_ENV);
+    }
+    let workspace_root = source_path::lexically_normalize(Path::new(value));
+    if !workspace_root.is_absolute() {
+        bail!(
+            "{} must be an absolute path, but was `{}`",
+            protocol::WORKSPACE_ROOT_ENV,
+            Path::new(value).display()
+        );
+    }
+    Ok(workspace_root)
 }
 
 fn validate_frontend_protocol_version(version: &str) -> Result<()> {
@@ -144,11 +182,18 @@ impl Callbacks for HawkCallbacks {
     fn config(&mut self, config: &mut interface::Config) {
         let run_id = self.run_id.clone();
         let collection_options = self.collection_options.as_env_value();
+        // The workspace root determines every serialized source span, so a
+        // change to it has to invalidate cached compilations.
+        let workspace_root = workspace_root().to_string_lossy().into_owned();
         config.track_state = Some(Box::new(move |session| {
             let mut env_depinfo = session.env_depinfo.borrow_mut();
             env_depinfo.insert((
                 Symbol::intern(protocol::RUN_ID_ENV),
                 Some(Symbol::intern(&run_id)),
+            ));
+            env_depinfo.insert((
+                Symbol::intern(protocol::WORKSPACE_ROOT_ENV),
+                Some(Symbol::intern(&workspace_root)),
             ));
             env_depinfo.insert((
                 Symbol::intern(protocol::COLLECTION_OPTIONS_ENV),
@@ -380,23 +425,23 @@ fn emit_fragment(
     let package_name = env::var("CARGO_PKG_NAME").context("read Cargo package name")?;
     let crate_name = tcx.crate_name(LOCAL_CRATE).to_string();
     let crate_id = id(tcx, CRATE_DEF_ID.to_def_id());
-    let is_non_production = consumer_mode == protocol::ConsumerMode::NonProduction;
-    let test_surface = is_non_production && tcx.sess.opts.test;
-    let is_product_root = if is_non_production {
-        // Non-production executables, including custom tests and benchmarks,
-        // can have entry points without `--test` but still consume APIs.
-        tcx.entry_fn(()).is_some()
-    } else {
-        crate_name == root_crate && tcx.entry_fn(()).is_some()
-    };
+    let classification = classify_fragment(
+        tcx.crate_types(),
+        &crate_name,
+        root_crate,
+        consumer_mode,
+        tcx.sess.opts.test,
+    );
     let suffix = crate_id.to_string();
     let fragment = collect_fragment(
         tcx,
         package_name,
         crate_name.clone(),
         crate_id,
-        is_product_root,
-        test_surface,
+        classification.is_product_root,
+        classification.root_kind,
+        classification.test_surface,
+        classification.non_production_consumer,
         collection_options,
     );
     let path = output_dir.join(format!("{crate_name}-{suffix}.json"));
@@ -408,6 +453,36 @@ fn emit_fragment(
         .map_err(|error| error.error)
         .with_context(|| format!("persist fragment {}", path.display()))?;
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FragmentClassification {
+    is_product_root: bool,
+    root_kind: Option<protocol::ProductionTargetKind>,
+    test_surface: bool,
+    non_production_consumer: bool,
+}
+
+fn classify_fragment(
+    crate_types: &[CrateType],
+    crate_name: &str,
+    root_crate: &str,
+    consumer_mode: protocol::ConsumerMode,
+    is_test: bool,
+) -> FragmentClassification {
+    let is_non_production = consumer_mode == protocol::ConsumerMode::NonProduction;
+    // `#![no_main]` executables have no Rust entry function but still consume APIs.
+    let is_executable = crate_types.contains(&CrateType::Executable);
+    let is_product_root = is_executable && (is_non_production || crate_name == root_crate);
+
+    FragmentClassification {
+        is_product_root,
+        root_kind: (is_product_root && !is_non_production)
+            .then_some(protocol::ProductionTargetKind::Binary),
+        test_surface: is_non_production && is_test,
+        non_production_consumer: is_non_production && is_test
+            || is_executable && (is_non_production || !is_product_root),
+    }
 }
 
 fn write_fragment(writer: impl Write, fragment: &Fragment, path: &Path) -> Result<()> {
@@ -425,7 +500,9 @@ fn collect_fragment(
     crate_name: String,
     crate_id: DefinitionId,
     is_product_root: bool,
+    root_kind: Option<protocol::ProductionTargetKind>,
     test_surface: bool,
+    non_production_consumer: bool,
     collection_options: CollectionOptions,
 ) -> Fragment {
     let mut definitions = Vec::new();
@@ -804,7 +881,11 @@ fn collect_fragment(
             })
             .filter(|def_id| {
                 let attrs = tcx.codegen_fn_attrs(def_id.to_def_id());
-                attrs.flags.contains(CodegenFnAttrFlags::NO_MANGLE) || attrs.symbol_name.is_some()
+                attrs.flags.intersects(
+                    CodegenFnAttrFlags::NO_MANGLE
+                        | CodegenFnAttrFlags::USED_COMPILER
+                        | CodegenFnAttrFlags::USED_LINKER,
+                ) || attrs.symbol_name.is_some()
             })
             .map(|def_id| id(tcx, def_id.to_def_id())),
     );
@@ -815,10 +896,13 @@ fn collect_fragment(
         protocol_version: crate::protocol::ProtocolVersion,
         package_name,
         crate_name,
+        compilation_target: tcx.sess.opts.target_triple.tuple().to_owned(),
         crate_id,
         crate_root: span(tcx, CRATE_DEF_ID).map(|span| span.file),
         is_product_root,
+        product_root_kind: root_kind,
         test_surface,
+        non_production_consumer,
         definitions,
         edges,
         roots,
@@ -1237,20 +1321,8 @@ fn declaration_span(
     let end = item_span.hi();
     let start_location = source_map.lookup_char_pos(start);
     let end_location = source_map.lookup_char_pos(end);
-    let file = normalize_source_path(
-        &start_location
-            .file
-            .name
-            .prefer_local_unconditionally()
-            .to_string(),
-    );
-    let end_file = normalize_source_path(
-        &end_location
-            .file
-            .name
-            .prefer_local_unconditionally()
-            .to_string(),
-    );
+    let file = source_file_path(tcx, &start_location.file.name);
+    let end_file = source_file_path(tcx, &end_location.file.name);
     (file == end_file).then_some(DeclarationSpan {
         file,
         byte_start: start_location
@@ -1268,34 +1340,102 @@ fn declaration_span(
 fn source_span(tcx: TyCtxt<'_>, span: rustc_span::Span) -> Span {
     let location = tcx.sess.source_map().lookup_char_pos(span.lo());
     Span {
-        file: normalize_source_path(
-            &location
-                .file
-                .name
-                .prefer_local_unconditionally()
-                .to_string(),
-        ),
+        file: source_file_path(tcx, &location.file.name),
         line: location.line,
         column: location.col.to_usize() + 1,
     }
 }
 
-fn normalize_source_path(path: &str) -> String {
-    let mut normalized = PathBuf::new();
-    for component in Path::new(&path).components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => match normalized.components().next_back() {
-                Some(Component::Normal(_)) => {
-                    normalized.pop();
-                }
-                Some(Component::RootDir | Component::Prefix(_)) => {}
-                _ => normalized.push(component.as_os_str()),
-            },
-            _ => normalized.push(component.as_os_str()),
-        }
+/// Cargo compiles one source file under different working directories, and
+/// reports its path relative to whichever was used. Hawk joins definitions from
+/// separate compilations by source span, so an unstable path splits a single
+/// declaration into two identities and corrupts reachability. Resolve each name
+/// against its own session's working directory, then express it relative to the
+/// workspace root so identity does not depend on either.
+fn source_file_path(tcx: TyCtxt<'_>, name: &FileName) -> String {
+    // Every span in one compilation shares this working directory, so deriving
+    // it here keeps ordinary and declaration spans on one canonical policy.
+    let working_directory = tcx
+        .sess
+        .opts
+        .working_dir
+        .local_path()
+        .unwrap_or(Path::new(""));
+    // The local physical path keeps identity on the real file and leaves the
+    // path loadable by the diagnostic renderer.
+    if let FileName::Real(name) = name
+        && let Some(path) = name.local_path()
+    {
+        return source_paths()
+            .normalize(working_directory, path)
+            .unwrap_or_else(|error| {
+                tcx.dcx()
+                    .fatal(format!("hawk could not resolve source identity: {error:#}"))
+            });
     }
-    normalized.to_string_lossy().into_owned()
+    // Remapped-only names, doctests, and synthetic files have no local path.
+    // What rustc reports for them already ignores the working directory.
+    source_path::lexical_identity(
+        workspace_root(),
+        Path::new(&name.prefer_local_unconditionally().to_string()),
+    )
+}
+
+/// Canonicalizes each local source once per compiler invocation.
+///
+/// Caching avoids filesystem work per span while ensuring every span-producing
+/// surface uses the same workspace-relative identity.
+#[derive(Debug)]
+struct SourcePathNormalizer {
+    workspace_root: PathBuf,
+    identities: Mutex<HashMap<PathBuf, String>>,
+}
+
+impl SourcePathNormalizer {
+    fn new(workspace_root: &Path) -> Result<Self> {
+        let workspace_root = workspace_root
+            .canonicalize()
+            .with_context(|| format!("resolve workspace root {}", workspace_root.display()))?;
+        Ok(Self {
+            workspace_root,
+            identities: Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn normalize(&self, working_directory: &Path, path: &Path) -> Result<String> {
+        let lexical_path = source_path::lexically_normalize(&working_directory.join(path));
+        if let Some(identity) = self
+            .identities
+            .lock()
+            .expect("source identity cache is not poisoned")
+            .get(&lexical_path)
+            .cloned()
+        {
+            return Ok(identity);
+        }
+
+        let identity = source_path::canonical_identity(&self.workspace_root, &lexical_path)
+            .with_context(|| format!("resolve source path {}", lexical_path.display()))?;
+        Ok(self
+            .identities
+            .lock()
+            .expect("source identity cache is not poisoned")
+            .entry(lexical_path)
+            .or_insert(identity)
+            .clone())
+    }
+}
+
+static SOURCE_PATHS: OnceLock<SourcePathNormalizer> = OnceLock::new();
+
+fn source_paths() -> &'static SourcePathNormalizer {
+    SOURCE_PATHS
+        .get()
+        .expect("source paths are initialized before the compiler starts")
+}
+
+fn workspace_root() -> &'static Path {
+    &source_paths().workspace_root
 }
 
 struct ReferenceVisitor<'tcx> {
@@ -1497,14 +1637,16 @@ mod tests {
     use std::collections::HashSet;
     use std::ffi::OsStr;
     use std::io::{self, Write};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use super::{
-        compact_visibility_modifier, normalize_source_path, parse_collection_options,
-        parse_consumer_mode, parse_run_id, source_item_at_or_after, type_alias_interface_targets,
+        FragmentClassification, SourcePathNormalizer, classify_fragment,
+        compact_visibility_modifier, parse_collection_options, parse_consumer_mode, parse_run_id,
+        parse_workspace_root, source_item_at_or_after, type_alias_interface_targets,
         uniform_field_group, validate_frontend_protocol_version, write_fragment,
     };
     use cargo_hawk_internal::graph::{CollectionOptions, Edge, EdgeKind, Fragment};
+    use rustc_session::config::CrateType;
 
     struct FailingWriter;
 
@@ -1525,7 +1667,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "Hawk frontend uses compiler driver protocol 1, but this driver uses protocol 7; install `cargo-hawk` and `cargo-hawk-driver` from the same release"
+            "Hawk frontend uses compiler driver protocol 1, but this driver uses protocol 9; install `cargo-hawk` and `cargo-hawk-driver` from the same release"
         );
     }
 
@@ -1535,10 +1677,13 @@ mod tests {
             protocol_version: crate::protocol::ProtocolVersion,
             package_name: "library".into(),
             crate_name: "library".into(),
+            compilation_target: "aarch64-apple-darwin".into(),
             crate_id: cargo_hawk_internal::graph::DefinitionId::new(0, 1),
             crate_root: Some("library/src/lib.rs".into()),
             is_product_root: false,
+            product_root_kind: None,
             test_surface: false,
+            non_production_consumer: false,
             definitions: vec![],
             edges: vec![],
             roots: vec![],
@@ -1550,6 +1695,89 @@ mod tests {
             .expect_err("buffer flush should report the underlying write failure");
 
         insta::assert_snapshot!(error.to_string(), @"flush fragment.json");
+    }
+
+    #[test]
+    fn executable_classification_does_not_require_a_rust_entry_point() {
+        assert_eq!(
+            classify_fragment(
+                &[CrateType::Executable],
+                "example",
+                "product",
+                crate::protocol::ConsumerMode::NonProduction,
+                false,
+            ),
+            FragmentClassification {
+                is_product_root: true,
+                root_kind: None,
+                test_surface: false,
+                non_production_consumer: true,
+            }
+        );
+        assert_eq!(
+            classify_fragment(
+                &[CrateType::Executable],
+                "product",
+                "product",
+                crate::protocol::ConsumerMode::Production,
+                false,
+            ),
+            FragmentClassification {
+                is_product_root: true,
+                root_kind: Some(crate::protocol::ProductionTargetKind::Binary),
+                test_surface: false,
+                non_production_consumer: false,
+            }
+        );
+    }
+
+    #[test]
+    fn executable_classification_preserves_consumer_and_test_provenance() {
+        assert_eq!(
+            classify_fragment(
+                &[CrateType::Executable],
+                "build_script_build",
+                "product",
+                crate::protocol::ConsumerMode::Production,
+                false,
+            ),
+            FragmentClassification {
+                is_product_root: false,
+                root_kind: None,
+                test_surface: false,
+                non_production_consumer: true,
+            }
+        );
+        assert_eq!(
+            classify_fragment(
+                &[CrateType::Rlib],
+                "library",
+                "product",
+                crate::protocol::ConsumerMode::NonProduction,
+                false,
+            ),
+            FragmentClassification {
+                is_product_root: false,
+                root_kind: None,
+                test_surface: false,
+                non_production_consumer: false,
+            }
+        );
+        assert_eq!(
+            classify_fragment(
+                &[CrateType::Executable],
+                "library",
+                "product",
+                crate::protocol::ConsumerMode::NonProduction,
+                true,
+            ),
+            FragmentClassification {
+                is_product_root: true,
+                root_kind: None,
+                test_surface: true,
+                non_production_consumer: true,
+            }
+        );
     }
 
     #[test]
@@ -1708,11 +1936,81 @@ mod tests {
     }
 
     #[test]
-    fn source_paths_are_lexically_normalized() {
+    fn workspace_root_must_be_present_and_absolute() {
+        let absolute = if cfg!(windows) {
+            "C:\\workspace"
+        } else {
+            "/workspace"
+        };
         assert_eq!(
-            normalize_source_path("library/tests/../src/shared.rs"),
-            "library/src/shared.rs"
+            parse_workspace_root(Some(OsStr::new(absolute))).expect("absolute root"),
+            PathBuf::from(absolute)
         );
-        assert_eq!(normalize_source_path("../shared.rs"), "../shared.rs");
+
+        for (value, expected) in [
+            (None, "Hawk frontend did not provide HAWK_WORKSPACE_ROOT"),
+            (Some(""), "HAWK_WORKSPACE_ROOT must not be empty"),
+            (
+                Some("relative/workspace"),
+                "HAWK_WORKSPACE_ROOT must be an absolute path, but was `relative/workspace`",
+            ),
+        ] {
+            let error = parse_workspace_root(value.map(OsStr::new))
+                .expect_err("invalid workspace root should fail");
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn source_paths_are_stable_across_compiler_working_directories() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let package_root = workspace.path().join("library");
+        std::fs::create_dir_all(package_root.join("src")).expect("create source directory");
+        std::fs::write(package_root.join("src/shared.rs"), "pub fn shared() {}\n")
+            .expect("write source file");
+        let source_paths = SourcePathNormalizer::new(workspace.path()).expect("resolve workspace");
+        let absolute_source = package_root.join("src/shared.rs");
+
+        for (working_directory, path) in [
+            (workspace.path(), Path::new("library/src/shared.rs")),
+            (
+                workspace.path(),
+                Path::new("library/tests/../src/shared.rs"),
+            ),
+            (package_root.as_path(), Path::new("src/shared.rs")),
+            (package_root.as_path(), Path::new("./src/shared.rs")),
+            (Path::new(""), absolute_source.as_path()),
+        ] {
+            assert_eq!(
+                source_paths
+                    .normalize(working_directory, path)
+                    .expect("normalize source path"),
+                "library/src/shared.rs",
+                "working directory {} with path {}",
+                working_directory.display(),
+                path.display()
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn source_paths_use_the_filesystem_spelling_on_windows() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        std::fs::create_dir_all(workspace.path().join("Library/SRC"))
+            .expect("create source directory");
+        std::fs::write(
+            workspace.path().join("Library/SRC/Shared.rs"),
+            "pub fn shared() {}\n",
+        )
+        .expect("write source file");
+        let source_paths = SourcePathNormalizer::new(workspace.path()).expect("resolve workspace");
+
+        assert_eq!(
+            source_paths
+                .normalize(workspace.path(), Path::new("library/src/shared.rs"))
+                .expect("normalize source path"),
+            "Library/SRC/Shared.rs"
+        );
     }
 }
